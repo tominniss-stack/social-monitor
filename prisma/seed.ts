@@ -1,4 +1,12 @@
-import { PrismaClient, Platform, TriageStatus, PriorityLevel, CommentCategory, Sentiment } from '@prisma/client';
+import {
+  PrismaClient,
+  Platform,
+  TriageStatus,
+  PriorityLevel,
+  CommentCategory,
+  Sentiment,
+  WorkspaceRole,
+} from '@prisma/client';
 
 const prisma = new PrismaClient();
 
@@ -7,16 +15,36 @@ async function main() {
 
   // 1. Clean existing records
   await prisma.contentCluster.deleteMany();
+  await prisma.triageOverride.deleteMany();
+  await prisma.auditLog.deleteMany();
+  await prisma.llmUsageDay.deleteMany();
+  await prisma.webhookEventLog.deleteMany();
   await prisma.commentTriage.deleteMany();
   await prisma.comment.deleteMany();
   await prisma.post.deleteMany();
   await prisma.platformAccount.deleteMany();
   await prisma.brandVoiceConfig.deleteMany();
+  await prisma.membership.deleteMany();
+  await prisma.workspace.deleteMany();
+
+  // 1b. Default workspace + dev membership (D-17)
+  const workspace = await prisma.workspace.create({
+    data: { name: 'Aether Agency', slug: 'default' },
+  });
+  await prisma.membership.create({
+    data: {
+      workspaceId: workspace.id,
+      email: process.env.DEV_USER_EMAIL || 'dev@localhost',
+      role: WorkspaceRole.ADMIN,
+    },
+  });
+  console.log('✓ Default workspace + ADMIN membership seeded');
 
   // 2. Default Brand Voice Configuration
   const brandVoice = await prisma.brandVoiceConfig.create({
     data: {
       id: 'default',
+      workspaceId: workspace.id,
       brandName: 'Aether AI',
       toneGuidelines:
         'Professional yet conversational, authoritative, helpful, and empathetic. Always use UK English spelling (e.g. prioritised, categorised, analyse). Never make unverified pricing promises or commit to unreleased feature deadlines publicly. Direct commercial queries to the demo booking link.',
@@ -43,6 +71,7 @@ async function main() {
       avatarUrl: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150&auto=format&fit=crop&q=80',
       isActive: true,
       lastSyncedAt: new Date(),
+      workspaceId: workspace.id,
     },
   });
 
@@ -55,6 +84,7 @@ async function main() {
       avatarUrl: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150&auto=format&fit=crop&q=80',
       isActive: true,
       lastSyncedAt: new Date(),
+      workspaceId: workspace.id,
     },
   });
   console.log('✓ Platform accounts seeded');
@@ -377,19 +407,29 @@ async function main() {
     },
   ];
 
+  // external id → internal id, so seeded clusters can reference real Comment rows
+  const internalIdByExternal = new Map<string, string>();
+
   for (const c of commentsData) {
     const { triage, ...commentFields } = c;
     const comment = await prisma.comment.create({
       data: commentFields,
     });
+    internalIdByExternal.set(comment.externalCommentId, comment.id);
 
     await prisma.commentTriage.create({
       data: {
         commentId: comment.id,
         ...triage,
+        // Seeded rows represent untouched AI output, so the AI originals equal the current values.
+        aiPriority: triage.priority,
+        aiCategory: triage.category,
       },
     });
   }
+
+  const ids = (...external: string[]) =>
+    external.map((e) => internalIdByExternal.get(e)).filter((v): v is string => Boolean(v));
   console.log('✓ 12 realistic comments and triage records seeded');
 
   // Add a sample nested reply from the brand to simulate active thread
@@ -422,8 +462,8 @@ async function main() {
       suggestedContentAngle:
         'Publish a comprehensive breakdown comparing per-seat vs unified workspace pricing models. Highlight how our agency license eliminates penalty fees for scaling community headcount.',
       recommendedFormats: ['IG Carousel (5 slides)', 'LinkedIn Deep Dive', 'Pricing Calculator Web Tool'],
-      commentCount: 18,
-      sampleCommentIds: ['comm_ig_001', 'comm_fb_008'],
+      commentCount: 2,
+      sampleCommentIds: ids('comm_ig_001', 'comm_fb_008'),
       dateRangeStart: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
       dateRangeEnd: new Date(),
     },
@@ -437,8 +477,8 @@ async function main() {
       suggestedContentAngle:
         'An architectural teardown showing how local Llama-3 / Ollama models route sensitive community data while strictly adhering to GDPR and UK Data Protection laws without leaking PII.',
       recommendedFormats: ['Technical Blog Post', 'Reels 60s Explainer', 'Security Architecture Whitepaper'],
-      commentCount: 14,
-      sampleCommentIds: ['comm_fb_003'],
+      commentCount: 1,
+      sampleCommentIds: ids('comm_fb_003'),
       dateRangeStart: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
       dateRangeEnd: new Date(),
     },
@@ -452,8 +492,8 @@ async function main() {
       suggestedContentAngle:
         'Short behind-the-scenes video showing a team member replying natively in the Instagram app and watching the desktop dashboard automatically flip from "Needs Reply" to "Answered" in real time.',
       recommendedFormats: ['TikTok / Reels Workflow Demo', 'Interactive GIF Showcase', 'Twitter/X Thread'],
-      commentCount: 9,
-      sampleCommentIds: ['comm_ig_006'],
+      commentCount: 1,
+      sampleCommentIds: ids('comm_ig_006'),
       dateRangeStart: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
       dateRangeEnd: new Date(),
     },

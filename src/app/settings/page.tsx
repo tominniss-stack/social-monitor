@@ -15,6 +15,7 @@ import {
   Trash2,
   Loader2,
 } from 'lucide-react';
+import { apiFetch } from '@/lib/api-client';
 
 export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
@@ -31,6 +32,8 @@ export default function SettingsPage() {
   // Meta accounts
   const [accounts, setAccounts] = useState<any[]>([]);
   const [metaConfig, setMetaConfig] = useState<any>(null);
+  // Real token validity (D-19): { valid, reason? } from GET /me?fields=id, or demo-mode reason.
+  const [tokenStatus, setTokenStatus] = useState<{ valid: boolean; reason?: string } | null>(null);
 
   // Simulation inline state
   const [simLoading, setSimLoading] = useState<string | null>(null);
@@ -40,8 +43,7 @@ export default function SettingsPage() {
     async function loadSettings() {
       try {
         setLoading(true);
-        const res = await fetch('/api/settings');
-        const data = await res.json();
+        const data = await apiFetch('/api/settings');
         if (data.success) {
           if (data.brandVoice) {
             setBrandName(data.brandVoice.brandName || 'Aether AI');
@@ -56,6 +58,7 @@ export default function SettingsPage() {
           }
           setAccounts(data.accounts || []);
           setMetaConfig(data.metaConfig || null);
+          setTokenStatus(data.tokenStatus || null);
         }
       } catch (err) {
         console.error('Failed to load settings:', err);
@@ -72,7 +75,7 @@ export default function SettingsPage() {
     setSavedSuccess(false);
 
     try {
-      const res = await fetch('/api/settings', {
+      const data = await apiFetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -83,7 +86,6 @@ export default function SettingsPage() {
           escalationRules,
         }),
       });
-      const data = await res.json();
       if (data.success) {
         setSavedSuccess(true);
         setTimeout(() => setSavedSuccess(false), 4000);
@@ -99,12 +101,11 @@ export default function SettingsPage() {
     setSimLoading(scenario);
     setSimResult(null);
     try {
-      const res = await fetch('/api/webhooks/simulate', {
+      const data = await apiFetch('/api/webhooks/simulate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scenario }),
       });
-      const data = await res.json();
       setSimResult(data);
     } catch (err: any) {
       setSimResult({ error: err.message });
@@ -112,6 +113,33 @@ export default function SettingsPage() {
       setSimLoading(null);
     }
   };
+
+  // Token pill: green = live token verified, amber = demo mode (no token), red = invalid + reason.
+  const isDemoToken = tokenStatus !== null && !tokenStatus.valid && (tokenStatus.reason || '').startsWith('demo mode');
+  const tokenDot =
+    tokenStatus === null
+      ? 'bg-slate-300 dark:bg-slate-600'
+      : tokenStatus.valid
+        ? 'bg-emerald-500'
+        : isDemoToken
+          ? 'bg-amber-500'
+          : 'bg-rose-500';
+  const tokenLabel =
+    tokenStatus === null
+      ? 'Checking token…'
+      : tokenStatus.valid
+        ? 'Token Verified'
+        : isDemoToken
+          ? 'Demo Mode (no token)'
+          : 'Token Invalid';
+  const tokenLabelClass =
+    tokenStatus === null
+      ? 'text-slate-400 dark:text-slate-500'
+      : tokenStatus.valid
+        ? 'text-emerald-600 dark:text-emerald-400'
+        : isDemoToken
+          ? 'text-amber-600 dark:text-amber-400'
+          : 'text-rose-600 dark:text-rose-400';
 
   if (loading) {
     return (
@@ -361,7 +389,7 @@ export default function SettingsPage() {
                         </span>
                         <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">{acc.name}</span>
                       </div>
-                      <span className="flex h-2 w-2 rounded-full bg-emerald-500" />
+                      <span className={`flex h-2 w-2 rounded-full ${tokenDot}`} title={tokenLabel} />
                     </div>
 
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 space-y-0.5 font-mono">
@@ -370,9 +398,12 @@ export default function SettingsPage() {
                     </div>
 
                     <div className="pt-1 flex items-center justify-between text-[10px] text-slate-400 dark:text-slate-500 border-t border-slate-200/60 dark:border-slate-800">
-                      <span>Status: Active</span>
-                      <span>Verified Token</span>
+                      <span>Status: {acc.isActive ? 'Active' : 'Inactive'}</span>
+                      <span className={`font-semibold ${tokenLabelClass}`}>{tokenLabel}</span>
                     </div>
+                    {tokenStatus && !tokenStatus.valid && !isDemoToken && tokenStatus.reason && (
+                      <div className="text-[10px] text-rose-600 dark:text-rose-400 break-words">{tokenStatus.reason}</div>
+                    )}
                   </div>
                 ))}
               </div>

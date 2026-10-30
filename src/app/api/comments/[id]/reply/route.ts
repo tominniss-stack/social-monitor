@@ -2,17 +2,19 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { metaGraph } from '@/lib/services/meta-graph';
 import { TriageStatus } from '@prisma/client';
+import { parseBody, replySchema, internalError } from '@/lib/validation';
+import { requireMembership, authErrorResponse } from '@/lib/auth/workspace';
+import { writeAudit } from '@/lib/audit';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
   try {
+    const { user, workspace } = await requireMembership('MANAGER');
     const { id } = params;
-    const { message } = await req.json();
-
-    if (!message || !message.trim()) {
-      return NextResponse.json({ error: 'Reply message cannot be empty' }, { status: 400 });
-    }
+    const parsed = await parseBody(req, replySchema);
+    if (!parsed.ok) return parsed.response;
+    const { message } = parsed.data; // already trimmed and length-checked
 
     const comment = await prisma.comment.findUnique({
       where: { id },
@@ -31,7 +33,8 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     const { externalReplyId } = await metaGraph.publishReply(
       comment.externalCommentId,
       comment.post.account.platform,
-      message.trim()
+      message,
+      comment.post.account
     );
 
     // Create the brand reply record in DB
@@ -43,7 +46,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
         authorName: comment.post.account.name,
         authorUsername: comment.post.account.handle,
         authorExternalId: comment.post.account.externalAccountId,
-        body: message.trim(),
+        body: message,
         isFromBrand: true,
         publishedAt: new Date(),
       },
@@ -56,15 +59,24 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
         commentId: comment.id,
         status: TriageStatus.ANSWERED,
         respondedAt: new Date(),
-        respondedBy: 'Community Manager (Dashboard)',
-        aiDraftReply: message.trim(),
+        respondedBy: user.email,
+        aiDraftReply: message,
       },
       update: {
         status: TriageStatus.ANSWERED,
         respondedAt: new Date(),
-        respondedBy: 'Community Manager (Dashboard)',
-        aiDraftReply: message.trim(),
+        respondedBy: user.email,
+        aiDraftReply: message,
       },
+    });
+
+    await writeAudit({
+      workspaceId: workspace.id,
+      actorEmail: user.email,
+      action: 'comment.reply',
+      targetType: 'comment',
+      targetId: comment.id,
+      metadata: { externalCommentId: comment.externalCommentId, messageLength: message.length, externalReplyId },
     });
 
     return NextResponse.json({
@@ -72,8 +84,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       reply: brandReply,
       triage: updatedTriage,
     });
-  } catch (err: any) {
-    console.error('[API Reply Error]:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  } catch (err) {
+    return authErrorResponse(err) ?? internalError('API Reply Error', err);
   }
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
@@ -15,14 +15,71 @@ import {
 } from 'lucide-react';
 import { WebhookSimulatorModal } from './WebhookSimulatorModal';
 import { useTheme } from './ThemeProvider';
+import { apiFetch } from '@/lib/api-client';
+
+type WebhookStatus = 'HEALTHY' | 'IDLE' | 'NO_TRAFFIC';
+
+const HEALTH_PILL: Record<
+  WebhookStatus,
+  { label: string; wrapper: string; dot: string; ping: boolean }
+> = {
+  HEALTHY: {
+    label: 'Meta Webhooks Healthy',
+    wrapper:
+      'border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/70 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300',
+    dot: 'bg-emerald-500',
+    ping: true,
+  },
+  IDLE: {
+    label: 'Meta Webhooks Idle',
+    wrapper:
+      'border-amber-200 dark:border-amber-800/60 bg-amber-50/70 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300',
+    dot: 'bg-amber-500',
+    ping: false,
+  },
+  NO_TRAFFIC: {
+    label: 'Awaiting Webhooks',
+    wrapper:
+      'border-slate-200 dark:border-slate-700 bg-slate-100/70 dark:bg-slate-800/60 text-slate-600 dark:text-slate-300',
+    dot: 'bg-slate-400',
+    ping: false,
+  },
+};
+
+const HEALTH_POLL_MS = 60_000;
 
 export function Navbar() {
   const pathname = usePathname();
   const [simulatorOpen, setSimulatorOpen] = useState(false);
   const { resolvedTheme, toggleTheme } = useTheme();
+  const [webhookStatus, setWebhookStatus] = useState<WebhookStatus | null>(null);
+  const [lastWebhookAt, setLastWebhookAt] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const data = await apiFetch('/api/health');
+        if (!cancelled && data?.success) {
+          setWebhookStatus(data.webhookStatus);
+          setLastWebhookAt(data.lastWebhookAt ?? null);
+        }
+      } catch {
+        // Pill simply stays in its last known state.
+      }
+    };
+    load();
+    const timer = setInterval(load, HEALTH_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const pill = webhookStatus ? HEALTH_PILL[webhookStatus] : null;
 
   const navItems = [
-    { href: '/', label: 'Prioritised Inbox', icon: Inbox },
+    { href: '/inbox', label: 'Prioritised Inbox', icon: Inbox },
     { href: '/insights', label: 'Content Ideas', icon: Lightbulb },
     { href: '/analytics', label: 'SLA Analytics', icon: BarChart3 },
     { href: '/settings', label: 'Settings & Simulator', icon: Settings },
@@ -34,7 +91,7 @@ export function Navbar() {
         <div className="flex h-14 items-center justify-between px-4 sm:px-6">
           {/* Logo & Brand */}
           <div className="flex items-center gap-6">
-            <Link href="/" className="flex items-center gap-2.5">
+            <Link href="/inbox" className="flex items-center gap-2.5">
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-white shadow-sm">
                 <Sparkles className="h-4 w-4" />
               </div>
@@ -52,7 +109,9 @@ export function Navbar() {
             <nav className="hidden md:flex items-center gap-1 pl-4">
               {navItems.map((item) => {
                 const Icon = item.icon;
-                const isActive = pathname === item.href;
+                // `/` redirects to `/inbox`, so treat both as the inbox tab.
+                const isActive =
+                  pathname === item.href || (item.href === '/inbox' && (pathname === '/' || pathname.startsWith('/inbox')));
                 return (
                   <Link
                     key={item.href}
@@ -73,13 +132,24 @@ export function Navbar() {
 
           {/* Right Actions, Health Pill & Dark Mode Toggle */}
           <div className="flex items-center gap-2.5 sm:gap-3">
-            <div className="hidden lg:flex items-center gap-1.5 rounded-full border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/70 dark:bg-emerald-950/40 px-2.5 py-1 text-[11px] font-medium text-emerald-800 dark:text-emerald-300">
-              <span className="relative flex h-2 w-2">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-              </span>
-              <span>Meta Webhooks Active &bull; &lt; 3s SLA</span>
-            </div>
+            {pill && (
+              <div
+                className={`hidden lg:flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${pill.wrapper}`}
+                title={
+                  lastWebhookAt
+                    ? `Last signed webhook: ${new Date(lastWebhookAt).toLocaleString('en-GB')}`
+                    : 'No signed webhook received yet'
+                }
+              >
+                <span className="relative flex h-2 w-2">
+                  {pill.ping && (
+                    <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${pill.dot}`}></span>
+                  )}
+                  <span className={`relative inline-flex rounded-full h-2 w-2 ${pill.dot}`}></span>
+                </span>
+                <span>{pill.label}</span>
+              </div>
+            )}
 
             {/* Dark Mode Toggle */}
             <button

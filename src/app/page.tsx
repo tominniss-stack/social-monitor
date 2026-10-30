@@ -1,11 +1,6 @@
-import { Navbar } from '@/components/Navbar';
-import { InboxView } from '@/components/InboxView';
+import { redirect } from 'next/navigation';
 
+/** The inbox lives at /inbox (spec §6.1); the root simply forwards there. */
 export default function HomePage() {
-  return (
-    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 transition-colors">
-      <Navbar />
-      <InboxView />
-    </div>
-  );
+  redirect('/inbox');
 }

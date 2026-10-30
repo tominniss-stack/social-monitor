@@ -1,42 +1,46 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { parseBody, settingsSchema, internalError } from '@/lib/validation';
+import { requireMembership, authErrorResponse, accountWorkspaceWhere } from '@/lib/auth/workspace';
+import { writeAudit } from '@/lib/audit';
+import { metaGraph } from '@/lib/services/meta-graph';
+import { getOrCreateBrandVoiceForWorkspace, findBrandVoiceForWorkspace, DEFAULT_BRAND_VOICE_ID } from '@/lib/brand-voice';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
   try {
-    let brandVoice = await prisma.brandVoiceConfig.findUnique({
-      where: { id: 'default' },
-    });
+    const { workspace, role } = await requireMembership('VIEWER');
 
-    if (!brandVoice) {
-      brandVoice = await prisma.brandVoiceConfig.create({
-        data: {
-          id: 'default',
-          brandName: 'Aether AI',
-          toneGuidelines:
-            'Professional yet conversational, authoritative, helpful, and empathetic. Always use UK English spelling. Direct commercial inquiries to the sales demo booking link.',
-          prohibitedPhrases: [
-            'guaranteed 10X ROI',
-            'our competitors suck',
-            'cheapest in the industry',
-            'no refunds under any circumstance',
-          ],
-          signOffStyle: 'Best regards, the Aether Community Team',
-          escalationRules:
-            'Escalate immediately if user mentions legal proceedings, critical security vulnerabilities, GDPR data deletion demands, or billing discrepancies over £500.',
+    const [brandVoice, accounts, tokenStatus] = await Promise.all([
+      getOrCreateBrandVoiceForWorkspace(workspace.id),
+      prisma.platformAccount.findMany({
+        where: accountWorkspaceWhere(workspace),
+        orderBy: { platform: 'asc' },
+        // Never ship the (encrypted) token to the browser.
+        select: {
+          id: true,
+          platform: true,
+          externalAccountId: true,
+          name: true,
+          handle: true,
+          avatarUrl: true,
+          isActive: true,
+          lastSyncedAt: true,
+          workspaceId: true,
+          createdAt: true,
+          updatedAt: true,
         },
-      });
-    }
-
-    const accounts = await prisma.platformAccount.findMany({
-      orderBy: { platform: 'asc' },
-    });
+      }),
+      metaGraph.checkTokenValidity(),
+    ]);
 
     return NextResponse.json({
       success: true,
+      workspace: { id: workspace.id, name: workspace.name, slug: workspace.slug, role },
       brandVoice,
       accounts,
+      tokenStatus,
       metaConfig: {
         appId: process.env.META_APP_ID || '1029384756',
         apiVersion: process.env.META_GRAPH_API_VERSION || 'v21.0',
@@ -44,44 +48,60 @@ export async function GET() {
         hasSystemToken: Boolean(process.env.META_SYSTEM_USER_ACCESS_TOKEN),
       },
     });
-  } catch (err: any) {
-    console.error('[API Settings GET Error]:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  } catch (err) {
+    return authErrorResponse(err) ?? internalError('API Settings GET Error', err);
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const { brandName, toneGuidelines, prohibitedPhrases, signOffStyle, escalationRules } = await req.json();
+    const { user, workspace } = await requireMembership('ADMIN');
+    const parsed = await parseBody(req, settingsSchema);
+    if (!parsed.ok) return parsed.response;
+    const { brandName, toneGuidelines, prohibitedPhrases, signOffStyle, escalationRules } = parsed.data;
 
-    const phrasesArray = Array.isArray(prohibitedPhrases)
-      ? prohibitedPhrases
-      : typeof prohibitedPhrases === 'string'
-      ? prohibitedPhrases.split(',').map((p) => p.trim()).filter(Boolean)
-      : [];
+    const phrasesArray = (
+      Array.isArray(prohibitedPhrases) ? prohibitedPhrases : prohibitedPhrases.split(',')
+    )
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .slice(0, 50);
 
-    const updated = await prisma.brandVoiceConfig.upsert({
-      where: { id: 'default' },
-      create: {
-        id: 'default',
-        brandName: brandName || 'Aether AI',
-        toneGuidelines: toneGuidelines || '',
-        prohibitedPhrases: phrasesArray,
-        signOffStyle: signOffStyle || null,
-        escalationRules: escalationRules || '',
-      },
-      update: {
-        brandName: brandName || 'Aether AI',
-        toneGuidelines: toneGuidelines || '',
-        prohibitedPhrases: phrasesArray,
-        signOffStyle: signOffStyle || null,
-        escalationRules: escalationRules || '',
+    const data = {
+      brandName,
+      toneGuidelines,
+      prohibitedPhrases: phrasesArray,
+      signOffStyle: signOffStyle?.trim() || null,
+      escalationRules,
+    };
+
+    // Resolve by workspace, falling back to the legacy 'default' row (and claiming it for this workspace).
+    const existing = await findBrandVoiceForWorkspace(workspace.id);
+    const updated = existing
+      ? await prisma.brandVoiceConfig.update({
+          where: { id: existing.id },
+          data: { ...data, workspaceId: existing.workspaceId ?? workspace.id },
+        })
+      : await prisma.brandVoiceConfig.create({
+          data: { id: DEFAULT_BRAND_VOICE_ID, workspaceId: workspace.id, ...data },
+        });
+
+    await writeAudit({
+      workspaceId: workspace.id,
+      actorEmail: user.email,
+      action: 'settings.update',
+      targetType: 'brandVoice',
+      targetId: updated.id,
+      metadata: {
+        brandName,
+        prohibitedPhraseCount: phrasesArray.length,
+        toneGuidelinesLength: toneGuidelines.length,
+        escalationRulesLength: escalationRules.length,
       },
     });
 
     return NextResponse.json({ success: true, brandVoice: updated });
-  } catch (err: any) {
-    console.error('[API Settings POST Error]:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  } catch (err) {
+    return authErrorResponse(err) ?? internalError('API Settings POST Error', err);
   }
 }

@@ -1,15 +1,36 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { internalError } from '@/lib/validation';
 import { PriorityLevel, CommentCategory, Sentiment, TriageStatus } from '@prisma/client';
+import {
+  getAiOverrideRatePercent,
+  getMedianIngestionLatencySeconds,
+  getRateLimitBudgetUsedPercent,
+  getWebhookHealth,
+  median,
+} from '@/lib/metrics';
+import { requireMembership, authErrorResponse, accountWorkspaceWhere } from '@/lib/auth/workspace';
 
 export const dynamic = 'force-dynamic';
 
+/**
+ * Every figure here is computed from stored data or live module state.
+ * Metrics with no underlying data are returned as `null` (never a baseline).
+ */
 export async function GET() {
   try {
-    const comments = await prisma.comment.findMany({
-      where: { isFromBrand: false },
-      include: { triage: true, post: true },
-    });
+    const { workspace } = await requireMembership('VIEWER');
+    const now = new Date();
+
+    const [comments, ingestionLatencySeconds, aiOverrideRatePercent, webhookHealth] = await Promise.all([
+      prisma.comment.findMany({
+        where: { isFromBrand: false, post: { account: accountWorkspaceWhere(workspace) } },
+        select: { publishedAt: true, triage: true },
+      }),
+      getMedianIngestionLatencySeconds(now),
+      getAiOverrideRatePercent(now),
+      getWebhookHealth(now),
+    ]);
 
     const totalComments = comments.length;
     let answeredCount = 0;
@@ -46,18 +67,14 @@ export async function GET() {
         needsAttentionCount++;
       }
 
-      if (c.triage.category) {
-        categoryBreakdown[c.triage.category] = (categoryBreakdown[c.triage.category] || 0) + 1;
-      }
-      if (c.triage.sentiment) {
-        sentimentBreakdown[c.triage.sentiment] = (sentimentBreakdown[c.triage.sentiment] || 0) + 1;
-      }
+      categoryBreakdown[c.triage.category] = (categoryBreakdown[c.triage.category] || 0) + 1;
+      sentimentBreakdown[c.triage.sentiment] = (sentimentBreakdown[c.triage.sentiment] || 0) + 1;
 
-      // Calculate TTFR for answered comments
-      if (c.triage.respondedAt && c.publishedAt) {
+      // TTFR for answered comments
+      if (c.triage.respondedAt) {
         const diffMinutes = Math.max(
-          1,
-          Math.round((new Date(c.triage.respondedAt).getTime() - new Date(c.publishedAt).getTime()) / (1000 * 60))
+          0,
+          (c.triage.respondedAt.getTime() - c.publishedAt.getTime()) / (1000 * 60)
         );
         if (c.triage.priority === PriorityLevel.P1_CRITICAL) {
           p1ResponseTimesMinutes.push(diffMinutes);
@@ -67,15 +84,7 @@ export async function GET() {
       }
     }
 
-    const calcMedian = (arr: number[]) => {
-      if (arr.length === 0) return 18; // baseline 18m
-      const sorted = [...arr].sort((a, b) => a - b);
-      const mid = Math.floor(sorted.length / 2);
-      return sorted.length % 2 !== 0 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
-    };
-
-    const medianP1 = calcMedian(p1ResponseTimesMinutes);
-    const medianP2 = calcMedian(p2ResponseTimesMinutes);
+    const roundMinutes = (v: number | null) => (v === null ? null : Math.round(v));
 
     return NextResponse.json({
       success: true,
@@ -84,19 +93,20 @@ export async function GET() {
         answeredCount,
         needsAttentionCount,
         responseRatePercent: totalComments > 0 ? Math.round((answeredCount / totalComments) * 100) : 0,
-        medianP1TtfrMinutes: medianP1,
-        medianP2TtfrMinutes: medianP2,
-        ingestionLatencySeconds: 14,
-        ingestionSuccessRate: 99.8,
-        aiOverrideRatePercent: 7.4, // Target is < 15%
-        webhookStatus: 'HEALTHY',
-        rateLimitBudgetUsedPercent: 3.2, // Meta BUC rate limit usage
+        medianP1TtfrMinutes: roundMinutes(median(p1ResponseTimesMinutes)),
+        medianP2TtfrMinutes: roundMinutes(median(p2ResponseTimesMinutes)),
+        p1SampleSize: p1ResponseTimesMinutes.length,
+        p2SampleSize: p2ResponseTimesMinutes.length,
+        ingestionLatencySeconds,
+        aiOverrideRatePercent,
+        webhookStatus: webhookHealth.webhookStatus,
+        lastWebhookAt: webhookHealth.lastWebhookAt,
+        rateLimitBudgetUsedPercent: getRateLimitBudgetUsedPercent(),
         categoryBreakdown,
         sentimentBreakdown,
       },
     });
-  } catch (err: any) {
-    console.error('[API Analytics Error]:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  } catch (err) {
+    return authErrorResponse(err) ?? internalError('API Analytics Error', err);
   }
 }

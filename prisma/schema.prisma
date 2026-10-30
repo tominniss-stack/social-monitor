@@ -47,6 +47,37 @@ enum Sentiment {
   NEGATIVE
 }
 
+/// Lightweight tenancy (D-17). One row per agency client. Identity comes from the
+/// verified auth email; there is deliberately no User/password table.
+model Workspace {
+  id          String       @id @default(uuid())
+  name        String
+  slug        String       @unique
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  memberships Membership[]
+  accounts    PlatformAccount[]
+}
+
+enum WorkspaceRole {
+  ADMIN
+  MANAGER
+  VIEWER
+}
+
+model Membership {
+  id          String        @id @default(uuid())
+  workspaceId String
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email       String
+  role        WorkspaceRole @default(MANAGER)
+  createdAt   DateTime      @default(now())
+
+  @@unique([workspaceId, email])
+  @@index([email])
+}
+
 model PlatformAccount {
   id                  String   @id @default(uuid())
   platform            Platform
@@ -54,15 +85,19 @@ model PlatformAccount {
   name                String
   handle              String?
   avatarUrl           String?
-  accessToken         String?  // Encrypted token or fallback to env System User token
+  accessToken         String?  // AES-256-GCM ciphertext (src/lib/crypto.ts) or null → env System User token
   isActive            Boolean  @default(true)
   lastSyncedAt        DateTime?
+  // Nullable so `db push` succeeds on existing rows; null is treated as the default workspace until backfilled.
+  workspaceId         String?
+  workspace           Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
   posts               Post[]
 
   @@index([platform, externalAccountId])
+  @@index([workspaceId])
 }
 
 model Post {
@@ -117,6 +152,10 @@ model CommentTriage {
   status              TriageStatus    @default(UNREAD)
   priority            PriorityLevel   @default(P3_STANDARD)
   category            CommentCategory @default(GENERAL_CHAT)
+  // Original AI-assigned values, preserved when a human overrides priority/category
+  // (denominator for the override-rate KPI). Null for triage rows created manually.
+  aiPriority          PriorityLevel?
+  aiCategory          CommentCategory?
   sentiment           Sentiment       @default(NEUTRAL)
   requiresHumanReply  Boolean         @default(true)
   aiReasoning         String?         @db.Text
@@ -144,8 +183,59 @@ model ContentCluster {
   createdAt              DateTime @default(now())
 }
 
+/// Audit row written whenever a human changes a triage field away from its current value.
+/// Deliberately standalone (no FK) so the log survives GDPR hard-deletes of the comment.
+model TriageOverride {
+  id          String   @id @default(uuid())
+  commentId   String
+  field       String   // "priority" | "category" | "status"
+  fromValue   String
+  toValue     String
+  actorEmail  String
+  createdAt   DateTime @default(now())
+
+  @@index([commentId])
+  @@index([createdAt])
+}
+
+/// Heartbeat row per inbound webhook POST — drives webhook health + ingestion metrics.
+model WebhookEventLog {
+  id          String    @id @default(uuid())
+  source      String    // "meta"
+  eventCount  Int
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime? // set only on the direct-exec fallback path; null when queued via Inngest
+
+  @@index([receivedAt])
+}
+
+/// Immutable actor/action trail (D-18 / SEC-11). No FKs so rows survive GDPR hard-deletes.
+model AuditLog {
+  id          String   @id @default(uuid())
+  workspaceId String?
+  actorEmail  String
+  action      String   // e.g. "comment.reply", "settings.update"
+  targetType  String   // e.g. "comment", "brandVoice", "simulator"
+  targetId    String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorEmail])
+}
+
+/// Daily OpenAI call counter (D-20 spend guard). `day` is 'YYYY-MM-DD' in UTC.
+model LlmUsageDay {
+  day       String   @id
+  calls     Int      @default(0)
+  estTokens Int      @default(0)
+  updatedAt DateTime @updatedAt
+}
+
 model BrandVoiceConfig {
   id                  String   @id @default("default")
+  // Nullable; the legacy 'default' row is attached to the default workspace by the seed.
+  workspaceId         String?  @unique
   brandName           String   @default("Acme AI")
   toneGuidelines      String   @db.Text
   prohibitedPhrases   String[]

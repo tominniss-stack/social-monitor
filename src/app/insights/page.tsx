@@ -14,6 +14,7 @@ import {
   X,
 } from 'lucide-react';
 import { format } from 'date-fns';
+import { apiFetch } from '@/lib/api-client';
 
 export default function InsightsPage() {
   const [clusters, setClusters] = useState<any[]>([]);
@@ -26,12 +27,11 @@ export default function InsightsPage() {
   const fetchInsights = async () => {
     try {
       setLoading(true);
-      const res = await fetch('/api/insights');
-      const data = await res.json();
+      const data = await apiFetch('/api/insights');
       if (data.success) {
         setClusters(data.clusters);
         setTotalQuestions(data.totalQuestionsAnalysed || 0);
-        setTopTopic(data.topEmergingTopic || 'Agency Pricing & Multi-Seat Models');
+        setTopTopic(data.topEmergingTopic || '');
       }
     } catch (err) {
       console.error('Failed to load insights:', err);
@@ -47,8 +47,7 @@ export default function InsightsPage() {
   const handleGenerateClusters = async () => {
     try {
       setGenerating(true);
-      const res = await fetch('/api/insights/generate', { method: 'POST' });
-      const data = await res.json();
+      const data = await apiFetch('/api/insights/generate', { method: 'POST' });
       if (data.success) {
         await fetchInsights();
       }
@@ -108,7 +107,7 @@ export default function InsightsPage() {
               <MessageCircle className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
             </div>
             <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-              {totalQuestions || 24}
+              {totalQuestions}
             </div>
             <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">Past 30 days &bull; Anonymised for GDPR</p>
           </div>
@@ -120,9 +119,9 @@ export default function InsightsPage() {
               <TrendingUp className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
             </div>
             <div className="mt-2 text-sm font-bold text-slate-900 dark:text-white truncate">
-              {topTopic}
+              {topTopic || <span className="text-slate-400 dark:text-slate-500 font-medium">No briefs generated yet</span>}
             </div>
-            <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">Highest commercial velocity</p>
+            <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">Largest cluster in the latest run</p>
           </div>
 
           {/* Card 3 */}
@@ -261,17 +260,28 @@ export default function InsightsPage() {
             </div>
 
             <div className="space-y-2.5 max-h-80 overflow-y-auto">
-              {selectedClusterForDrawer.sampleCommentIds?.map((id: string, idx: number) => (
-                <div key={id} className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3 text-xs space-y-1">
-                  <div className="flex items-center justify-between text-[10px] text-slate-400 dark:text-slate-500 font-mono">
-                    <span>Source #{idx + 1} &bull; {id}</span>
-                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Anonymised</span>
+              {(selectedClusterForDrawer.evidence?.length ?? 0) === 0 ? (
+                <p className="text-xs text-slate-400 dark:text-slate-500 italic p-3">
+                  The source comments for this brief are no longer available (they may have been deleted on request).
+                </p>
+              ) : (
+                selectedClusterForDrawer.evidence.map((ev: any, idx: number) => (
+                  <div
+                    key={ev.id}
+                    className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3 text-xs space-y-1.5"
+                  >
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 dark:text-slate-500 font-mono">
+                      <span>
+                        Source #{idx + 1} &bull; {ev.platform === 'INSTAGRAM' ? 'Instagram' : ev.platform === 'FACEBOOK' ? 'Facebook' : ev.platform}
+                        {ev.category && <> &bull; {String(ev.category).replace(/_/g, ' ')}</>}
+                        {ev.publishedAt && <> &bull; {format(new Date(ev.publishedAt), 'dd MMM')}</>}
+                      </span>
+                      <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Anonymised</span>
+                    </div>
+                    <p className="text-slate-700 dark:text-slate-300 italic">&quot;{ev.redactedBody}&quot;</p>
                   </div>
-                  <p className="text-slate-700 dark:text-slate-300 italic">
-                    &quot;Direct customer question regarding tier structures and multi-seat licensing models.&quot;
-                  </p>
-                </div>
-              ))}
+                ))
+              )}
             </div>
 
             <div className="pt-2 flex justify-end">

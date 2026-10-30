@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  verify:
+    name: Lint, verify & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # `next build` imports src/lib/auth at module load, which instantiates the
+      # configured provider eagerly. AUTH_PROVIDER=dev is refused when
+      # NODE_ENV=production (which `next build` sets), so we build with the
+      # Cloudflare Access provider and placeholder team/AUD values. These are
+      # never contacted at build time — the JWT is only verified per-request.
+      AUTH_PROVIDER: cloudflare-access
+      CF_ACCESS_TEAM_DOMAIN: ci.example.cloudflareaccess.com
+      CF_ACCESS_AUD: ci-aud
+      # Prisma only needs a syntactically valid URL to generate the client; no DB is contacted.
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Verify webhook parsing fixtures
+        run: npm run verify:webhooks
+
+      - name: Verify PII redaction
+        run: npm run verify:pii
+
+      - name: Build
+        run: npm run build
+
+      # Non-blocking: surfaces high/critical advisories in the job log without
+      # failing the pipeline. Transitive advisories in the Next/Prisma/AI SDK
+      # trees frequently have no upstream fix yet, and a hard fail here would
+      # block unrelated changes. Review the output on every run and promote this
+      # to a blocking step once the dependency set is stable.
+      - name: npm audit (report only)
+        run: npm audit --audit-level=high || true

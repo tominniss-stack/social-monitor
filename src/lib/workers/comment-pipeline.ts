@@ -1,6 +1,6 @@
 import { prisma } from '@/lib/prisma';
 import { metaGraph } from '@/lib/services/meta-graph';
-import { triageComment } from '@/lib/ai/triage-agent';
+import { triageComment, type TriageResult } from '@/lib/ai/triage-agent';
 import { updateCommentEmbedding } from '@/lib/ai/clustering-agent';
 import { Platform, TriageStatus, PriorityLevel, CommentCategory, Sentiment } from '@prisma/client';
 
@@ -37,8 +37,10 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
     return { status: 'deleted' };
   }
 
-  // 2. Ensure Platform Account exists or find matching account
-  let account = await prisma.platformAccount.findFirst({
+  // 2. Resolve the Platform Account by exact (platform, externalAccountId) match.
+  // Unknown accounts are rejected — never fall back to another account or create one,
+  // otherwise one client's comments could be attached to another client's Page.
+  const account = await prisma.platformAccount.findFirst({
     where: {
       platform: event.platform,
       externalAccountId: event.accountId,
@@ -46,22 +48,10 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
   });
 
   if (!account) {
-    // If not found by exact ID, find any active account for that platform or create a placeholder
-    account = await prisma.platformAccount.findFirst({
-      where: { platform: event.platform },
-    });
-
-    if (!account) {
-      account = await prisma.platformAccount.create({
-        data: {
-          platform: event.platform,
-          externalAccountId: event.accountId,
-          name: event.platform === Platform.FACEBOOK ? 'Aether AI UK' : 'Aether AI Official',
-          handle: event.platform === Platform.FACEBOOK ? '@AetherAI_UK' : '@aetherai.io',
-          isActive: true,
-        },
-      });
-    }
+    console.warn(
+      `[Worker] Ignoring event ${event.externalCommentId}: no ${event.platform} account registered for externalAccountId=${event.accountId}`
+    );
+    return { status: 'unknown_account' as const };
   }
 
   // 3. Ensure Parent Post Exists in Database
@@ -86,11 +76,8 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
     });
   }
 
-  // 4. Check for Brand Self-Reply (Native App Sync)
-  const isFromBrand =
-    event.authorExternalId === account.externalAccountId ||
-    event.authorName.toLowerCase().includes('aether ai') ||
-    event.authorExternalId === 'brand_official_id';
+  // 4. Check for Brand Self-Reply (Native App Sync) — external account ID match ONLY.
+  const isFromBrand = event.authorExternalId === account.externalAccountId;
 
   // Find parent internal comment ID if this is a reply to another comment
   let internalParentCommentId: string | null = null;
@@ -168,6 +155,7 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
   if (!brandVoice) {
     brandVoice = {
       id: 'default',
+      workspaceId: null,
       brandName: 'Aether AI',
       toneGuidelines: 'Helpful, concise, authoritative, and polite. UK English spelling.',
       prohibitedPhrases: ['10x profit', 'guaranteed outcome'],
@@ -215,17 +203,11 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
     threadHistory,
   });
 
-  // Determine initial status
-  let initialStatus: TriageStatus = TriageStatus.UNREAD;
-  if (!triageResult.requiresHumanReply) {
-    initialStatus = triageResult.category === 'SPAM_TROLL' ? TriageStatus.IGNORED : TriageStatus.ANSWERED;
-  } else if (triageResult.draftReply) {
-    initialStatus = TriageStatus.DRAFT_READY;
-  } else {
-    initialStatus = TriageStatus.NEEDS_REPLY;
-  }
+  // Determine initial status (spec §5.3.5 + escalation path)
+  const initialStatus = resolveInitialStatus(triageResult, brandVoice.escalationRules);
 
-  // Upsert CommentTriage
+  // Upsert CommentTriage. `aiPriority`/`aiCategory` preserve the model's original
+  // call so human overrides can be measured (override-rate KPI, C-15).
   const triageRecord = await prisma.commentTriage.upsert({
     where: { commentId: comment.id },
     create: {
@@ -233,6 +215,8 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
       status: initialStatus,
       priority: triageResult.priority as PriorityLevel,
       category: triageResult.category as CommentCategory,
+      aiPriority: triageResult.priority as PriorityLevel,
+      aiCategory: triageResult.category as CommentCategory,
       sentiment: triageResult.sentiment as Sentiment,
       requiresHumanReply: triageResult.requiresHumanReply,
       aiReasoning: triageResult.reasoning,
@@ -242,6 +226,8 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
     update: {
       priority: triageResult.priority as PriorityLevel,
       category: triageResult.category as CommentCategory,
+      aiPriority: triageResult.priority as PriorityLevel,
+      aiCategory: triageResult.category as CommentCategory,
       sentiment: triageResult.sentiment as Sentiment,
       requiresHumanReply: triageResult.requiresHumanReply,
       aiReasoning: triageResult.reasoning,
@@ -261,4 +247,29 @@ export async function processCommentEvent(event: WebhookCommentEvent) {
   }
 
   return { status: 'classified', commentId: comment.id, triage: triageRecord };
+}
+
+/**
+ * Maps a triage result to its initial queue status.
+ *
+ *  - `requiresHumanReply === false` → IGNORED (never auto-ANSWERED; nothing was answered).
+ *  - escalation (model flag, or COMPLAINT_SUPPORT + P1_CRITICAL while the brand has
+ *    escalation rules configured) → ESCALATED.
+ *  - otherwise DRAFT_READY when a draft exists, NEEDS_REPLY when it does not.
+ */
+export function resolveInitialStatus(
+  triage: Pick<TriageResult, 'requiresHumanReply' | 'escalate' | 'category' | 'priority' | 'draftReply'>,
+  escalationRules: string | null | undefined
+): TriageStatus {
+  if (!triage.requiresHumanReply) {
+    return TriageStatus.IGNORED;
+  }
+
+  const hasEscalationRules = Boolean(escalationRules && escalationRules.trim().length > 0);
+  const criticalComplaint = triage.category === 'COMPLAINT_SUPPORT' && triage.priority === 'P1_CRITICAL';
+  if (triage.escalate === true || (hasEscalationRules && criticalComplaint)) {
+    return TriageStatus.ESCALATED;
+  }
+
+  return triage.draftReply ? TriageStatus.DRAFT_READY : TriageStatus.NEEDS_REPLY;
 }

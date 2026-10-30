@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   Loader2,
 } from 'lucide-react';
+import { apiFetch } from '@/lib/api-client';
 
 interface Props {
   isOpen: boolean;
@@ -84,7 +85,7 @@ export function WebhookSimulatorModal({ isOpen, onClose, onEventSimulated }: Pro
     setResult(null);
 
     try {
-      const res = await fetch('/api/webhooks/simulate', {
+      const data = await apiFetch('/api/webhooks/simulate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -93,7 +94,6 @@ export function WebhookSimulatorModal({ isOpen, onClose, onEventSimulated }: Pro
         }),
       });
 
-      const data = await res.json();
       setResult(data);
       onEventSimulated();
     } catch (err: any) {

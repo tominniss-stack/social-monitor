@@ -1,44 +1,61 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { Platform, TriageStatus, PriorityLevel, CommentCategory } from '@prisma/client';
+import { internalError } from '@/lib/validation';
+import { Platform, TriageStatus, CommentCategory, Prisma } from '@prisma/client';
+import { requireMembership, authErrorResponse, accountWorkspaceWhere } from '@/lib/auth/workspace';
 
 export const dynamic = 'force-dynamic';
 
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+
+function parseLimit(raw: string | null): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_LIMIT;
+  return Math.min(Math.floor(n), MAX_LIMIT);
+}
+
+/**
+ * Inbox feed (D-22): workspace-scoped, cursor-paginated, DB-side ordering.
+ *
+ * `?cursor=<commentId>&limit=<1..100>` — returns `nextCursor` (null when exhausted).
+ * NEEDS_ATTENTION orders by triage priority first. Prisma sorts enums in schema
+ * declaration order and `PriorityLevel` is declared P1_CRITICAL → P4_LOW, so
+ * `asc` yields P1 first. All other queues are newest-first.
+ */
 export async function GET(req: NextRequest) {
   try {
+    const { workspace } = await requireMembership('VIEWER');
+
     const searchParams = req.nextUrl.searchParams;
     const platform = searchParams.get('platform'); // ALL, FACEBOOK, INSTAGRAM
     const postType = searchParams.get('postType'); // ALL, ORGANIC, PAID
     const queue = searchParams.get('queue') || 'NEEDS_ATTENTION';
     const search = searchParams.get('search')?.trim();
+    const cursor = searchParams.get('cursor')?.trim() || null;
+    const limit = parseLimit(searchParams.get('limit'));
 
-    // Base filter: Only top-level comments (or non-brand comments)
-    const where: any = {
-      parentCommentId: null, // top-level threads
-    };
+    // Base filter: top-level comments belonging to this workspace's accounts.
+    const accountWhere: Prisma.PlatformAccountWhereInput = { ...accountWorkspaceWhere(workspace) };
 
     // Platform filter
     if (platform && platform !== 'ALL') {
-      where.post = {
-        ...(where.post || {}),
-        account: {
-          platform: platform as Platform,
-        },
-      };
+      accountWhere.platform = platform as Platform;
     }
+
+    const postWhere: Prisma.PostWhereInput = { account: accountWhere };
 
     // Post Type filter (Organic vs Paid Dark Ads)
     if (postType === 'ORGANIC') {
-      where.post = {
-        ...(where.post || {}),
-        isPaidAd: false,
-      };
+      postWhere.isPaidAd = false;
     } else if (postType === 'PAID') {
-      where.post = {
-        ...(where.post || {}),
-        isPaidAd: true,
-      };
+      postWhere.isPaidAd = true;
     }
+
+    const where: Prisma.CommentWhereInput = {
+      parentCommentId: null, // top-level threads
+      post: postWhere,
+    };
 
     // Queue filter
     switch (queue) {
@@ -78,7 +95,6 @@ export async function GET(req: NextRequest) {
     // Search filter across author name, username, body, or post caption
     if (search) {
       where.AND = [
-        ...(where.AND || []),
         {
           OR: [
             { body: { contains: search, mode: 'insensitive' } },
@@ -90,7 +106,13 @@ export async function GET(req: NextRequest) {
       ];
     }
 
-    const comments = await prisma.comment.findMany({
+    const orderBy: Prisma.CommentOrderByWithRelationInput[] =
+      queue === 'NEEDS_ATTENTION'
+        ? [{ triage: { priority: 'asc' } }, { publishedAt: 'desc' }, { id: 'asc' }]
+        : [{ publishedAt: 'desc' }, { id: 'asc' }];
+
+    // Fetch one extra row to know whether another page exists.
+    const rows = await prisma.comment.findMany({
       where,
       include: {
         post: {
@@ -103,32 +125,17 @@ export async function GET(req: NextRequest) {
           orderBy: { publishedAt: 'asc' },
         },
       },
-      orderBy: [
-        { publishedAt: 'desc' },
-      ],
-      take: 100,
+      orderBy,
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
-    // Custom sort: For Needs Attention, prioritize P1_CRITICAL -> P2_HIGH -> P3_STANDARD -> P4_LOW
-    const priorityWeight: Record<PriorityLevel, number> = {
-      P1_CRITICAL: 4,
-      P2_HIGH: 3,
-      P3_STANDARD: 2,
-      P4_LOW: 1,
-    };
+    const hasMore = rows.length > limit;
+    const comments = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore && comments.length > 0 ? comments[comments.length - 1].id : null;
 
-    if (queue === 'NEEDS_ATTENTION') {
-      comments.sort((a, b) => {
-        const weightA = a.triage?.priority ? priorityWeight[a.triage.priority] : 0;
-        const weightB = b.triage?.priority ? priorityWeight[b.triage.priority] : 0;
-        if (weightB !== weightA) return weightB - weightA;
-        return new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime();
-      });
-    }
-
-    return NextResponse.json({ success: true, count: comments.length, comments });
-  } catch (err: any) {
-    console.error('[API Comments GET Error]:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({ success: true, count: comments.length, nextCursor, comments });
+  } catch (err) {
+    return authErrorResponse(err) ?? internalError('API Comments GET Error', err);
   }
 }

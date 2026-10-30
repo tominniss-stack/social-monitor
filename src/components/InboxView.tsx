@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Inbox,
   Search,
@@ -23,10 +23,15 @@ import {
   CheckCheck,
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
+import { apiFetch } from '@/lib/api-client';
 
 type PlatformFilter = 'ALL' | 'FACEBOOK' | 'INSTAGRAM';
 type PostTypeFilter = 'ALL' | 'ORGANIC' | 'PAID';
 type QueueFilter = 'NEEDS_ATTENTION' | 'HIGH_INTENT' | 'COMPLAINTS' | 'ANSWERED' | 'SPAM';
+type BulkAction = 'mark_answered' | 'mark_ignored' | 'hide';
+
+const PAGE_SIZE = 50;
+const POLL_INTERVAL_MS = 30_000;
 
 export function InboxView() {
   const [platform, setPlatform] = useState<PlatformFilter>('ALL');
@@ -37,6 +42,17 @@ export function InboxView() {
   const [loading, setLoading] = useState(true);
   const [selectedCommentId, setSelectedCommentId] = useState<string | null>(null);
 
+  // Pagination (D-22): cursor for "Load more"; polling is skipped while a load-more is in flight.
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loadingMoreRef = useRef(false);
+
+  // Bulk selection (D-22): checkbox per card → toolbar.
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
+  const [bulkLoading, setBulkLoading] = useState(false);
+
+  const feedRef = useRef<HTMLDivElement>(null);
+
   // Inspector State
   const [isPostContextOpen, setIsPostContextOpen] = useState(true);
   const [replyText, setReplyText] = useState('');
@@ -44,40 +60,114 @@ export function InboxView() {
   const [toneLoading, setToneLoading] = useState(false);
   const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
 
-  // Fetch comments
-  const fetchComments = useCallback(async () => {
-    try {
-      setLoading(true);
+  // Real system metrics (C-16): rate-limit budget from /api/health, override KPI from /api/analytics.
+  const [rateLimitUsedPercent, setRateLimitUsedPercent] = useState<number | null>(null);
+  const [overrideRatePercent, setOverrideRatePercent] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [health, analytics] = await Promise.all([apiFetch('/api/health'), apiFetch('/api/analytics')]);
+        if (cancelled) return;
+        if (health?.success && typeof health.rateLimitBudgetUsedPercent === 'number') {
+          setRateLimitUsedPercent(health.rateLimitBudgetUsedPercent);
+        }
+        if (analytics?.success && typeof analytics.stats?.aiOverrideRatePercent === 'number') {
+          setOverrideRatePercent(analytics.stats.aiOverrideRatePercent);
+        }
+      } catch (err) {
+        console.error('Error fetching system metrics:', err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const buildParams = useCallback(
+    (cursor?: string | null) => {
       const params = new URLSearchParams({
         platform,
         postType,
         queue,
+        limit: String(PAGE_SIZE),
       });
       if (search.trim()) params.append('search', search.trim());
+      if (cursor) params.append('cursor', cursor);
+      return params;
+    },
+    [platform, postType, queue, search]
+  );
 
-      const res = await fetch(`/api/comments?${params.toString()}`);
-      const data = await res.json();
-      if (data.success) {
-        setComments(data.comments);
-        if (data.comments.length > 0) {
-          // If previous selection is not in list or null, select first
-          setSelectedCommentId((prev) => {
-            if (prev && data.comments.some((c: any) => c.id === prev)) return prev;
-            return data.comments[0].id;
+  // Fetch the first page (also used by polling). `silent` keeps the spinner off for background refreshes.
+  const fetchComments = useCallback(
+    async (opts: { silent?: boolean } = {}) => {
+      try {
+        if (!opts.silent) setLoading(true);
+        const data = await apiFetch(`/api/comments?${buildParams().toString()}`);
+        if (data.success) {
+          setComments(data.comments);
+          setNextCursor(data.nextCursor ?? null);
+          setCheckedIds((prev) => {
+            if (prev.size === 0) return prev;
+            const live = new Set<string>(data.comments.map((c: any) => c.id));
+            const next = new Set<string>();
+            prev.forEach((id) => live.has(id) && next.add(id));
+            return next;
           });
-        } else {
-          setSelectedCommentId(null);
+          if (data.comments.length > 0) {
+            // If previous selection is not in list or null, select first
+            setSelectedCommentId((prev) => {
+              if (prev && data.comments.some((c: any) => c.id === prev)) return prev;
+              return data.comments[0].id;
+            });
+          } else {
+            setSelectedCommentId(null);
+          }
         }
+      } catch (err) {
+        console.error('Error fetching comments:', err);
+      } finally {
+        if (!opts.silent) setLoading(false);
       }
-    } catch (err) {
-      console.error('Error fetching comments:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, [platform, postType, queue, search]);
+    },
+    [buildParams]
+  );
 
   useEffect(() => {
     fetchComments();
+  }, [fetchComments]);
+
+  // Append the next page (D-22 cursor pagination).
+  const loadMore = useCallback(async () => {
+    if (!nextCursor || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const data = await apiFetch(`/api/comments?${buildParams(nextCursor).toString()}`);
+      if (data.success) {
+        setComments((prev) => {
+          const seen = new Set(prev.map((c) => c.id));
+          return [...prev, ...data.comments.filter((c: any) => !seen.has(c.id))];
+        });
+        setNextCursor(data.nextCursor ?? null);
+      }
+    } catch (err) {
+      console.error('Error loading more comments:', err);
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [nextCursor, buildParams]);
+
+  // Live updates: poll the first page every 30s (skipped while a load-more is in flight).
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (loadingMoreRef.current) return;
+      fetchComments({ silent: true });
+    }, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
   }, [fetchComments]);
 
   // Listen to simulator events
@@ -88,6 +178,72 @@ export function InboxView() {
   }, [fetchComments]);
 
   const selectedComment = comments.find((c) => c.id === selectedCommentId) || null;
+
+  // Keyboard navigation: j/k or ArrowDown/ArrowUp move the selection when the feed has focus.
+  const moveSelection = useCallback(
+    (delta: 1 | -1) => {
+      if (comments.length === 0) return;
+      const index = comments.findIndex((c) => c.id === selectedCommentId);
+      const nextIndex = index === -1 ? 0 : Math.min(comments.length - 1, Math.max(0, index + delta));
+      const nextId = comments[nextIndex].id;
+      setSelectedCommentId(nextId);
+      const el = feedRef.current?.querySelector<HTMLElement>(`[data-comment-id="${nextId}"]`);
+      el?.focus();
+      el?.scrollIntoView({ block: 'nearest' });
+    },
+    [comments, selectedCommentId]
+  );
+
+  const handleFeedKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') return;
+    if (e.key === 'j' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      moveSelection(1);
+    } else if (e.key === 'k' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveSelection(-1);
+    }
+  };
+
+  const toggleChecked = (id: string) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // Bulk actions → POST /api/comments/bulk (max 50 ids per request).
+  const handleBulkAction = async (action: BulkAction) => {
+    const ids = Array.from(checkedIds).slice(0, 50);
+    if (ids.length === 0) return;
+    if (action === 'hide' && !confirm(`Hide ${ids.length} comment(s) on Meta?`)) return;
+    setBulkLoading(true);
+    try {
+      const data = await apiFetch('/api/comments/bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids, action }),
+      });
+      if (data.success) {
+        const label =
+          action === 'mark_answered' ? 'marked as Answered' : action === 'mark_ignored' ? 'marked as Ignored' : 'hidden on Meta';
+        setFeedbackMessage(
+          `${data.affected} comment(s) ${label}${data.failed?.length ? ` (${data.failed.length} failed)` : ''}.`
+        );
+        setCheckedIds(new Set());
+        await fetchComments();
+      } else if (data.error) {
+        setFeedbackMessage(`Bulk action failed: ${data.error}`);
+      }
+    } catch (err) {
+      console.error('Bulk action failed:', err);
+    } finally {
+      setBulkLoading(false);
+    }
+  };
 
   // Sync composer with comment draft
   useEffect(() => {
@@ -102,12 +258,11 @@ export function InboxView() {
     if (!selectedComment || !replyText.trim()) return;
     setActionLoading(true);
     try {
-      const res = await fetch(`/api/comments/${selectedComment.id}/reply`, {
+      const data = await apiFetch(`/api/comments/${selectedComment.id}/reply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: replyText }),
       });
-      const data = await res.json();
       if (data.success) {
         setFeedbackMessage('Reply published natively to Meta and marked as Answered.');
         await fetchComments();
@@ -124,7 +279,7 @@ export function InboxView() {
     if (!selectedComment) return;
     setActionLoading(true);
     try {
-      await fetch(`/api/comments/${selectedComment.id}/triage`, {
+      await apiFetch(`/api/comments/${selectedComment.id}/triage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: 'ANSWERED' }),
@@ -144,7 +299,7 @@ export function InboxView() {
     setActionLoading(true);
     try {
       const newHiddenState = !selectedComment.isHidden;
-      await fetch(`/api/comments/${selectedComment.id}/visibility`, {
+      await apiFetch(`/api/comments/${selectedComment.id}/visibility`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ isHidden: newHiddenState }),
@@ -166,7 +321,7 @@ export function InboxView() {
     }
     setActionLoading(true);
     try {
-      await fetch(`/api/comments/${selectedComment.id}`, { method: 'DELETE' });
+      await apiFetch(`/api/comments/${selectedComment.id}`, { method: 'DELETE' });
       setFeedbackMessage('Comment deleted natively and purged from database.');
       await fetchComments();
     } catch (err) {
@@ -181,12 +336,11 @@ export function InboxView() {
     if (!selectedComment) return;
     setToneLoading(true);
     try {
-      const res = await fetch(`/api/comments/${selectedComment.id}/tone`, {
+      const data = await apiFetch(`/api/comments/${selectedComment.id}/tone`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tone }),
       });
-      const data = await res.json();
       if (data.success && data.aiDraftReply) {
         setReplyText(data.aiDraftReply);
       }
@@ -201,7 +355,7 @@ export function InboxView() {
   const handleOverrideTriage = async (type: 'priority' | 'category', value: string) => {
     if (!selectedComment) return;
     try {
-      await fetch(`/api/comments/${selectedComment.id}/triage`, {
+      await apiFetch(`/api/comments/${selectedComment.id}/triage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ [type]: value }),
@@ -342,7 +496,19 @@ export function InboxView() {
         <div className="pt-4 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-400 dark:text-slate-500 space-y-1">
           <div className="flex items-center justify-between">
             <span>Rate Limit Budget</span>
-            <span className="font-semibold text-emerald-600 dark:text-emerald-400">3.2% Used</span>
+            <span
+              className={`font-semibold ${
+                rateLimitUsedPercent === null
+                  ? 'text-slate-400 dark:text-slate-500'
+                  : rateLimitUsedPercent >= 90
+                    ? 'text-rose-600 dark:text-rose-400'
+                    : rateLimitUsedPercent >= 70
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : 'text-emerald-600 dark:text-emerald-400'
+              }`}
+            >
+              {rateLimitUsedPercent === null ? '—' : `${rateLimitUsedPercent}% Used`}
+            </span>
           </div>
           <div className="flex items-center justify-between">
             <span>LLM Triage Engine</span>
@@ -379,12 +545,62 @@ export function InboxView() {
             </span>
             <span className="rounded-full bg-slate-100 dark:bg-slate-800 px-2 py-0.5 font-mono text-[11px] font-medium text-slate-600 dark:text-slate-300">
               {comments.length}
+              {nextCursor ? '+' : ''}
             </span>
           </div>
+
+          {/* Bulk action toolbar (appears when ≥1 card is checked) */}
+          {checkedIds.size > 0 && (
+            <div
+              role="toolbar"
+              aria-label="Bulk actions"
+              className="flex items-center justify-between gap-2 rounded-lg border border-indigo-200 dark:border-indigo-800 bg-indigo-50/80 dark:bg-indigo-950/40 px-2.5 py-1.5 text-[11px]"
+            >
+              <span className="font-semibold text-indigo-800 dark:text-indigo-200">{checkedIds.size} selected</span>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => handleBulkAction('mark_answered')}
+                  disabled={bulkLoading}
+                  className="rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1 font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                >
+                  Mark Answered
+                </button>
+                <button
+                  onClick={() => handleBulkAction('mark_ignored')}
+                  disabled={bulkLoading}
+                  className="rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1 font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                >
+                  Mark Ignored
+                </button>
+                <button
+                  onClick={() => handleBulkAction('hide')}
+                  disabled={bulkLoading}
+                  className="rounded border border-rose-200 dark:border-rose-900/60 bg-rose-50 dark:bg-rose-950/40 px-2 py-1 font-medium text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/60 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                >
+                  {bulkLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Hide'}
+                </button>
+                <button
+                  onClick={() => setCheckedIds(new Set())}
+                  disabled={bulkLoading}
+                  aria-label="Clear selection"
+                  className="px-1.5 py-1 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 rounded"
+                >
+                  &times;
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
-        {/* Comment Cards List */}
-        <div className="flex-1 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800/60">
+        {/* Comment Cards List — keyboard: j/k or ↑/↓ move selection, Enter/Space selects */}
+        <div
+          ref={feedRef}
+          role="listbox"
+          aria-label="Comment feed"
+          tabIndex={0}
+          onKeyDown={handleFeedKeyDown}
+          className="flex-1 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500"
+        >
           {loading ? (
             <div className="flex flex-col items-center justify-center h-48 gap-2 text-slate-400 dark:text-slate-500">
               <Loader2 className="h-5 w-5 animate-spin text-indigo-600 dark:text-indigo-400" />
@@ -397,8 +613,10 @@ export function InboxView() {
               <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-1">No comments match the selected filters.</p>
             </div>
           ) : (
-            comments.map((comment) => {
+            <>
+            {comments.map((comment) => {
               const isSelected = comment.id === selectedCommentId;
+              const isChecked = checkedIds.has(comment.id);
               const isPaid = comment.post.isPaidAd;
               const priority = comment.triage?.priority || 'P3_STANDARD';
               const category = comment.triage?.category || 'GENERAL_CHAT';
@@ -415,16 +633,37 @@ export function InboxView() {
               return (
                 <div
                   key={comment.id}
+                  data-comment-id={comment.id}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={isSelected}
                   onClick={() => setSelectedCommentId(comment.id)}
-                  className={`p-3.5 cursor-pointer transition-colors relative border-l-4 ${
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setSelectedCommentId(comment.id);
+                    }
+                  }}
+                  className={`p-3.5 cursor-pointer transition-colors relative border-l-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500 ${
                     isSelected
                       ? 'bg-indigo-50/50 dark:bg-indigo-950/30 border-l-indigo-600 dark:border-l-indigo-500'
                       : 'hover:bg-slate-50 dark:hover:bg-slate-900/50 border-l-transparent'
-                  }`}
+                  } ${isChecked ? 'ring-1 ring-inset ring-indigo-300 dark:ring-indigo-700' : ''}`}
                 >
                   {/* Top Metadata */}
                   <div className="flex items-center justify-between gap-1.5 mb-1.5">
                     <div className="flex items-center gap-1.5 flex-wrap">
+                      {/* Bulk checkbox */}
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        aria-label={`Select comment by ${comment.authorName}`}
+                        onClick={(e) => e.stopPropagation()}
+                        onKeyDown={(e) => e.stopPropagation()}
+                        onChange={() => toggleChecked(comment.id)}
+                        className="h-3.5 w-3.5 rounded border-slate-300 dark:border-slate-600 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                      />
+
                       {/* Platform Icon */}
                       <span
                         className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold text-white ${
@@ -495,7 +734,22 @@ export function InboxView() {
                   </div>
                 </div>
               );
-            })
+            })}
+
+            {/* Load more (cursor pagination) */}
+            {nextCursor && (
+              <div className="p-3 flex justify-center">
+                <button
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  className="flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                >
+                  {loadingMore ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                  <span>{loadingMore ? 'Loading…' : 'Load more'}</span>
+                </button>
+              </div>
+            )}
+            </>
           )}
         </div>
       </section>
@@ -650,7 +904,8 @@ export function InboxView() {
                   </h3>
                 </div>
                 <span className="text-[11px] text-slate-400 dark:text-slate-500">
-                  Override Rate KPI: &lt; 15% (Currently 7.4%)
+                  Override Rate KPI: &lt; 15%
+                  {overrideRatePercent !== null && ` (Currently ${overrideRatePercent}%)`}
                 </span>
               </div>
 

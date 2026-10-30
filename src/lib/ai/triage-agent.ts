@@ -1,6 +1,17 @@
 import { z } from 'zod';
 import { generateObject } from 'ai';
 import { openai } from '@ai-sdk/openai';
+import { assertBudget, LlmBudgetExceededError } from '@/lib/llm-budget';
+
+/*
+ * PII note (SEC-10 / C-14): comment bodies and thread history on THIS path are
+ * deliberately NOT passed through `redactPII()` — the agent must see the full
+ * comment (including any contact details the customer volunteered) to classify
+ * it correctly and draft a usable reply. Redaction is applied on the insights /
+ * clustering path only (`src/lib/ai/clustering-agent.ts`, `/api/insights`),
+ * where bodies are aggregated and leave the system for analysis rather than for
+ * a direct, human-approved response.
+ */
 
 export const TriageOutputSchema = z.object({
   priority: z.enum(['P1_CRITICAL', 'P2_HIGH', 'P3_STANDARD', 'P4_LOW']),
@@ -14,6 +25,8 @@ export const TriageOutputSchema = z.object({
   ]),
   sentiment: z.enum(['POSITIVE', 'NEUTRAL', 'NEGATIVE']),
   requiresHumanReply: z.boolean(),
+  /** True when the brand's escalation rules apply (legal, security, PR risk, urgent outage…). */
+  escalate: z.boolean(),
   reasoning: z.string(),
   extractedTopicTags: z.array(z.string()).max(5),
   draftReply: z.string().nullable(),
@@ -41,6 +54,9 @@ export async function triageComment(input: TriageInput): Promise<TriageResult> {
 
   if (apiKey && apiKey.startsWith('sk-') && apiKey.length > 20) {
     try {
+      // Spend guard (D-20): over budget → deterministic classifier, never a dropped comment.
+      await assertBudget('triage');
+
       const historyContext = input.threadHistory?.length
         ? `\nPrior Thread History:\n${input.threadHistory.map((h) => `${h.isFromBrand ? 'Brand' : h.author}: "${h.body}"`).join('\n')}`
         : '';
@@ -70,6 +86,8 @@ Taxonomy Rules:
 - P3_STANDARD: Positive feedback (PRAISE), friend tagging, general agreement (GENERAL_CHAT).
 - P4_LOW: Emojis only, irrelevant chatter, or suspected scam/phishing bots (SPAM_TROLL).
 
+Escalation: set escalate=true ONLY when the Escalation Rules above apply to this comment (e.g. legal threats, security incidents, PR/reputational risk, urgent service outages). Otherwise escalate=false.
+
 Return UK English spelling (e.g. prioritised, organised, analyse) in your reasoning and draftReply. If spam or low priority emoji, draftReply should be null and requiresHumanReply false.`;
 
       const { object } = await generateObject({
@@ -80,7 +98,11 @@ Return UK English spelling (e.g. prioritised, organised, analyse) in your reason
 
       return object;
     } catch (err) {
-      console.warn('[TriageAgent] OpenAI request failed or timed out, falling back to deterministic classifier:', err);
+      if (err instanceof LlmBudgetExceededError) {
+        console.warn(`[TriageAgent] ${err.message} Falling back to deterministic classifier.`);
+      } else {
+        console.warn('[TriageAgent] OpenAI request failed or timed out, falling back to deterministic classifier:', err);
+      }
     }
   }
 
@@ -114,6 +136,7 @@ function runDeterministicTriage(input: TriageInput): TriageResult {
       category: 'SPAM_TROLL',
       sentiment: 'NEUTRAL',
       requiresHumanReply: false,
+      escalate: false,
       reasoning: 'Suspected unsolicited promotional or phishing bot.',
       extractedTopicTags: ['spam', 'unsolicited'],
       draftReply: null,
@@ -144,6 +167,7 @@ function runDeterministicTriage(input: TriageInput): TriageResult {
       category: 'LEAD_ENQUIRY',
       sentiment: text.includes('not') || text.includes('expensive') ? 'NEUTRAL' : 'POSITIVE',
       requiresHumanReply: true,
+      escalate: false,
       reasoning: 'High-intent commercial enquiry requesting pricing, demo, or tier information.',
       extractedTopicTags: ['pricing', 'lead-intent', input.isPaidAd ? 'ad-conversion' : 'organic-inbound'],
       draftReply: `Hello ${input.authorName}! Thank you for reaching out to ${input.brandVoice.brandName}. We would be delighted to share pricing and workspace options tailored to your team. You can explore our demo walkthrough or reserve a direct session at aetherai.io/book-demo.`,
@@ -175,6 +199,7 @@ function runDeterministicTriage(input: TriageInput): TriageResult {
       category: 'COMPLAINT_SUPPORT',
       sentiment: 'NEGATIVE',
       requiresHumanReply: true,
+      escalate: isUrgent,
       reasoning: isUrgent
         ? 'Urgent customer support issue or service disruption reported.'
         : 'Customer service complaint requiring empathetic investigation.',
@@ -207,6 +232,7 @@ function runDeterministicTriage(input: TriageInput): TriageResult {
       category: 'PRODUCT_QUESTION',
       sentiment: 'NEUTRAL',
       requiresHumanReply: true,
+      escalate: false,
       reasoning: 'Product functionality, capability, or integration inquiry regarding post context.',
       extractedTopicTags: ['product-inquiry', 'capability'],
       draftReply: `Hi ${input.authorName}! Great question. ${input.brandVoice.brandName} is built specifically to address this seamlessly within our unified platform. Check out our docs at docs.aetherai.io or let us know if you would like a personalised walkthrough!`,
@@ -221,6 +247,7 @@ function runDeterministicTriage(input: TriageInput): TriageResult {
       category: 'PRAISE',
       sentiment: 'POSITIVE',
       requiresHumanReply: false,
+      escalate: false,
       reasoning: 'Positive community sentiment and appreciation.',
       extractedTopicTags: ['customer-praise', 'brand-love'],
       draftReply: `Thank you so much, ${input.authorName}! We really appreciate the kind feedback and support 🙌`,
@@ -234,6 +261,7 @@ function runDeterministicTriage(input: TriageInput): TriageResult {
       category: 'GENERAL_CHAT',
       sentiment: 'NEUTRAL',
       requiresHumanReply: false,
+      escalate: false,
       reasoning: 'Brief reaction or emoji-only response.',
       extractedTopicTags: ['social-reaction'],
       draftReply: null,
@@ -246,6 +274,7 @@ function runDeterministicTriage(input: TriageInput): TriageResult {
     category: 'GENERAL_CHAT',
     sentiment: 'NEUTRAL',
     requiresHumanReply: false,
+    escalate: false,
     reasoning: 'General community discussion and comment thread engagement.',
     extractedTopicTags: ['community-chat'],
     draftReply: `Thanks for sharing your thoughts, ${input.authorName}!`,

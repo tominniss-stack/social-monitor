@@ -2,13 +2,21 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { generateText } from 'ai';
 import { openai } from '@ai-sdk/openai';
+import { parseBody, toneSchema, internalError } from '@/lib/validation';
+import { requireMembership, authErrorResponse } from '@/lib/auth/workspace';
+import { writeAudit } from '@/lib/audit';
+import { findBrandVoiceForWorkspace } from '@/lib/brand-voice';
+import { assertBudget, LlmBudgetExceededError } from '@/lib/llm-budget';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
   try {
+    const { user, workspace } = await requireMembership('MANAGER');
     const { id } = params;
-    const { tone } = await req.json(); // 'shorter' | 'empathetic' | 'cta'
+    const parsed = await parseBody(req, toneSchema);
+    if (!parsed.ok) return parsed.response;
+    const { tone } = parsed.data; // 'shorter' | 'empathetic' | 'cta'
 
     const comment = await prisma.comment.findUnique({
       where: { id },
@@ -23,7 +31,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     }
 
     const currentDraft = comment.triage.aiDraftReply || '';
-    const brandVoice = (await prisma.brandVoiceConfig.findUnique({ where: { id: 'default' } })) || {
+    const brandVoice = (await findBrandVoiceForWorkspace(workspace.id)) || {
       brandName: 'Aether AI',
       toneGuidelines: 'Polite and professional',
       signOffStyle: 'Best regards',
@@ -31,8 +39,20 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
 
     const apiKey = process.env.OPENAI_API_KEY;
     let newDraft = '';
+    let usedLlm = false;
 
     if (apiKey && apiKey.startsWith('sk-') && apiKey.length > 20) {
+      // Spend guard (D-20): this is a user-triggered gpt-4o call, so over budget → 429.
+      try {
+        await assertBudget('tone');
+      } catch (budgetErr) {
+        if (budgetErr instanceof LlmBudgetExceededError) {
+          console.warn('[Tone] ' + budgetErr.message);
+          return NextResponse.json({ error: 'Daily AI budget exceeded' }, { status: 429 });
+        }
+        throw budgetErr;
+      }
+
       try {
         const toneInstructions: Record<string, string> = {
           shorter: 'Condense this reply to be ultra-punchy and direct, strictly under 25 words while remaining polite.',
@@ -41,7 +61,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
           cta: 'Rewrite this reply to include a clear, compelling call-to-action inviting them to book a briefing or visit aetherai.io/demo.',
         };
 
-        const instruction = toneInstructions[tone] || 'Refine the reply tone.';
+        const instruction = toneInstructions[tone];
 
         const response = await generateText({
           model: openai('gpt-4o'),
@@ -57,6 +77,7 @@ Requirements: Use UK English spelling. Retain brand voice.`,
         });
 
         newDraft = response.text.trim();
+        usedLlm = Boolean(newDraft);
       } catch (e) {
         console.warn('OpenAI tone regeneration error:', e);
       }
@@ -81,9 +102,17 @@ Requirements: Use UK English spelling. Retain brand voice.`,
       data: { aiDraftReply: newDraft },
     });
 
+    await writeAudit({
+      workspaceId: workspace.id,
+      actorEmail: user.email,
+      action: 'draft.tone',
+      targetType: 'comment',
+      targetId: id,
+      metadata: { tone, usedLlm, draftLength: newDraft.length },
+    });
+
     return NextResponse.json({ success: true, aiDraftReply: newDraft });
-  } catch (err: any) {
-    console.error('[API Tone Regeneration Error]:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  } catch (err) {
+    return authErrorResponse(err) ?? internalError('API Tone Regeneration Error', err);
   }
 }

@@ -1,0 +1,45 @@
+// NON-COMPILED DOCUMENTATION STUB — rename to `authjs.ts` to activate.
+//
+// Shows how a future Auth.js (next-auth) provider plugs into the auth seam.
+// Swap procedure (see plans/auth-wireframe.md §6):
+//   1. `npm install next-auth`
+//   2. Rename this file to `authjs.ts` and implement the TODOs.
+//   3. Add `case 'authjs': return new AuthJsProvider();` to getAuthProvider() in ../index.ts
+//   4. Add `/api/auth/` to PUBLIC_PATHS (Auth.js needs its own routes reachable unauthenticated).
+//   5. Set AUTH_PROVIDER=authjs and AUTH_SECRET. Nothing downstream changes — everything keys on `email`.
+
+import { getToken } from 'next-auth/jwt';
+import type { NextRequest } from 'next/server';
+import type { AuthContext, AuthProvider } from '../types';
+
+export class AuthJsProvider implements AuthProvider {
+  readonly id = 'authjs' as const;
+
+  constructor() {
+    if (!process.env.AUTH_SECRET) {
+      throw new Error('[auth] AuthJsProvider requires AUTH_SECRET');
+    }
+  }
+
+  async authenticate(req: NextRequest): Promise<AuthContext | null> {
+    try {
+      const token = await getToken({ req, secret: process.env.AUTH_SECRET });
+      if (!token?.email) return null;
+      return {
+        email: String(token.email).toLowerCase(),
+        name: typeof token.name === 'string' ? token.name : undefined,
+        // TODO: map IdP groups/roles from the token if your Auth.js callbacks expose them.
+        groups: undefined,
+        provider: this.id,
+        expiresAt: typeof token.exp === 'number' ? new Date(token.exp * 1000) : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  loginUrl(req: NextRequest): string {
+    const callbackUrl = encodeURIComponent(req.nextUrl.pathname + req.nextUrl.search);
+    return `/api/auth/signin?callbackUrl=${callbackUrl}`;
+  }
+}
